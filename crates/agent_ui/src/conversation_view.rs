@@ -2001,6 +2001,7 @@ impl ConversationView {
                         );
                     });
                     active.update(cx, |active, cx| {
+                        active.remeasure_tool_activity_group(index, cx);
                         active.sync_elicitation_state_for_entry(index, window, cx);
                         active.sync_editor_mode(cx);
                         active.sync_generating_indicator(cx);
@@ -2016,6 +2017,7 @@ impl ConversationView {
                     });
                     list_state.remeasure_items(*index..*index + 1);
                     active.update(cx, |active, cx| {
+                        active.remeasure_tool_activity_group(*index, cx);
                         if active.editing_message == Some(*index)
                             && !active.can_edit_user_message(*index, cx)
                         {
@@ -12648,6 +12650,170 @@ pub(crate) mod tests {
                 assert_eq!(copied.as_deref(), Some(expected));
             }
         }
+    }
+
+    fn enable_collapse_tool_activity(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store
+                    .set_user_settings(r#"{ "agent": { "collapse_tool_activity": true } }"#, cx)
+                    .expect("collapse tool activity settings");
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_collapse_tool_activity_groups_tool_calls(cx: &mut TestAppContext) {
+        use crate::entry_view_state::{ToolActivitySummary, tool_activity_group};
+
+        init_test(cx);
+        enable_collapse_tool_activity(cx);
+
+        let tool_call = |id: &str, title: &str, status| {
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new(acp_v1::ToolCallId::new(id), title)
+                    .kind(acp_v1::ToolKind::Read)
+                    .status(status),
+            )
+        };
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(
+                "Plan the work".into(),
+            )),
+            tool_call(
+                "tool-1",
+                "Read papaya file",
+                acp_v1::ToolCallStatus::Completed,
+            ),
+            tool_call("tool-2", "Run tests", acp_v1::ToolCallStatus::Failed),
+            tool_call("tool-3", "Read more", acp_v1::ToolCallStatus::Completed),
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new("Done".into())),
+        ]);
+        let (conversation_view, cx) =
+            setup_full_size_conversation_and_send(connection, "Do the work", cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let group_id = acp_v2::ToolCallId::new("tool-1");
+
+        thread_view.read_with(cx, |view, cx| {
+            let entries = view.thread.read(cx).entries();
+            assert_eq!(entries.len(), 6);
+            let group = tool_activity_group(entries, 3).expect("tool calls should form a group");
+            assert_eq!(group.range, 1..5);
+            assert_eq!(group.id, group_id);
+            assert_eq!(tool_activity_group(entries, 0), None);
+            assert_eq!(tool_activity_group(entries, 5), None);
+
+            let summary = ToolActivitySummary::new(&entries[group.range]);
+            assert_eq!(summary.tool_count, 3);
+            assert_eq!(summary.failed_count, 1);
+            assert!(!summary.is_running);
+
+            let state = view.entry_view_state.read(cx);
+            for entry_ix in 1..5 {
+                assert!(state.is_hidden_by_tool_activity(entries, entry_ix, cx));
+            }
+            assert!(!state.is_hidden_by_tool_activity(entries, 0, cx));
+            assert!(!state.is_hidden_by_tool_activity(entries, 5, cx));
+        });
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.toggle_search(&crate::ToggleSearch, window, cx);
+        });
+        cx.run_until_parked();
+        let bar = thread_view
+            .read_with(cx, |view, _| view.thread_search_bar.clone())
+            .expect("thread_search_bar should be set after toggle_search");
+        bar.update_in(cx, |bar, window, cx| {
+            bar.query_editor.update(cx, |editor, cx| {
+                editor.set_text("papaya", window, cx);
+            });
+            bar.update_matches(window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            bar.read_with(cx, |bar, _| bar.match_count()),
+            0,
+            "collapsed tool activity should not be searched",
+        );
+
+        thread_view.update(cx, |view, cx| {
+            view.entry_view_state.update(cx, |state, _| {
+                state.toggle_tool_activity_group_expansion(&group_id);
+            });
+        });
+        bar.update_in(cx, |bar, window, cx| bar.update_matches(window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            bar.read_with(cx, |bar, _| bar.match_count()),
+            1,
+            "expanded tool activity should be searchable",
+        );
+        thread_view.read_with(cx, |view, cx| {
+            let entries = view.thread.read(cx).entries();
+            let state = view.entry_view_state.read(cx);
+            assert!(!state.is_hidden_by_tool_activity(entries, 2, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_collapse_tool_activity_keeps_tool_awaiting_confirmation_visible(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::entry_view_state::{ToolActivitySummary, tool_activity_group};
+
+        init_test(cx);
+        enable_collapse_tool_activity(cx);
+
+        let waiting_tool_call_id = acp_v2::ToolCallId::new("tool-2");
+        let connection =
+            StubAgentConnection::new().with_permission_requests(HashMap::from_iter([(
+                waiting_tool_call_id.clone(),
+                PermissionOptions::Flat(vec![acp_v2::PermissionOption::new(
+                    "1",
+                    "Allow",
+                    acp_v2::PermissionOptionKind::AllowOnce,
+                )]),
+            )]));
+        connection.set_next_prompt_updates(vec![
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new(acp_v1::ToolCallId::new("tool-1"), "Read file")
+                    .kind(acp_v1::ToolKind::Read)
+                    .status(acp_v1::ToolCallStatus::Completed),
+            ),
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new(
+                    acp_v1::ToolCallId::new(waiting_tool_call_id.0.clone()),
+                    "Edit file",
+                )
+                .kind(acp_v1::ToolKind::Edit)
+                .content(vec!["hi".into()]),
+            ),
+        ]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Edit the file", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            let entries = view.thread.read(cx).entries();
+            assert_eq!(entries.len(), 3);
+            let group = tool_activity_group(entries, 1).expect("tool calls should form a group");
+            assert_eq!(group.range, 1..3);
+            assert!(ToolActivitySummary::new(&entries[group.range]).is_running);
+
+            let state = view.entry_view_state.read(cx);
+            assert!(state.is_hidden_by_tool_activity(entries, 1, cx));
+            assert!(
+                !state.is_hidden_by_tool_activity(entries, 2, cx),
+                "tool call awaiting confirmation should stay visible",
+            );
+        });
     }
 
     #[gpui::test]

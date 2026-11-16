@@ -1,6 +1,6 @@
 use std::{ops::Range, sync::Arc};
 
-use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk, ToolCall};
+use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk, ToolCall, ToolCallStatus};
 use agent::ThreadStore;
 use agent_client_protocol::v2::schema as acp_v2;
 use agent_settings::AgentSettings;
@@ -65,6 +65,9 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp_v2::ToolCallId>,
+    /// Tool activity groups the user expanded, keyed by the first tool call of the group.
+    /// The first tool call stays stable while the agent appends entries to the group.
+    expanded_tool_activity_groups: HashSet<acp_v2::ToolCallId>,
     /// Subagent cards shown for an ACP parent's outgoing session messages.
     expanded_session_message_cards: HashSet<acp_v2::MessageId>,
 }
@@ -89,6 +92,7 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            expanded_tool_activity_groups: HashSet::default(),
             expanded_session_message_cards: HashSet::default(),
         }
     }
@@ -112,6 +116,31 @@ impl EntryViewState {
     pub(crate) fn toggle_tool_call_expansion(&mut self, tool_call_id: &acp_v2::ToolCallId) {
         if !self.expanded_tool_calls.remove(tool_call_id) {
             self.expanded_tool_calls.insert(tool_call_id.clone());
+        }
+    }
+
+    pub(crate) fn is_tool_activity_group_expanded(&self, group_id: &acp_v2::ToolCallId) -> bool {
+        self.expanded_tool_activity_groups.contains(group_id)
+    }
+
+    /// Whether `collapse_tool_activity` hides the entry inside a collapsed group.
+    pub(crate) fn is_hidden_by_tool_activity(
+        &self,
+        entries: &[AgentThreadEntry],
+        entry_ix: usize,
+        cx: &App,
+    ) -> bool {
+        AgentSettings::get_global(cx).collapse_tool_activity
+            && entries
+                .get(entry_ix)
+                .is_some_and(|entry| !entry_needs_user_input(entry))
+            && tool_activity_group(entries, entry_ix)
+                .is_some_and(|group| !self.is_tool_activity_group_expanded(&group.id))
+    }
+
+    pub(crate) fn toggle_tool_activity_group_expansion(&mut self, group_id: &acp_v2::ToolCallId) {
+        if !self.expanded_tool_activity_groups.remove(group_id) {
+            self.expanded_tool_activity_groups.insert(group_id.clone());
         }
     }
 
@@ -665,6 +694,105 @@ impl EntryViewState {
 }
 
 impl EventEmitter<EntryViewEvent> for EntryViewState {}
+
+/// A run of consecutive tool calls and thought-only assistant messages that
+/// `collapse_tool_activity` shows as one summary row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolActivityGroup {
+    pub range: Range<usize>,
+    /// The first tool call in the group. It identifies the group across re-renders.
+    pub id: acp_v2::ToolCallId,
+}
+
+pub(crate) fn entry_needs_user_input(entry: &AgentThreadEntry) -> bool {
+    matches!(
+        entry,
+        AgentThreadEntry::ToolCall(tool_call)
+            if tool_call.status() == ToolCallStatus::WaitingForConfirmation
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolActivitySummary {
+    pub tool_count: usize,
+    pub failed_count: usize,
+    pub is_running: bool,
+}
+
+impl ToolActivitySummary {
+    pub(crate) fn new(entries: &[AgentThreadEntry]) -> Self {
+        let mut summary = Self {
+            tool_count: 0,
+            failed_count: 0,
+            is_running: false,
+        };
+        for entry in entries {
+            let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                continue;
+            };
+            summary.tool_count += 1;
+            match tool_call.status() {
+                ToolCallStatus::Failed => summary.failed_count += 1,
+                ToolCallStatus::Pending
+                | ToolCallStatus::WaitingForConfirmation
+                | ToolCallStatus::InProgress
+                | ToolCallStatus::Paused => summary.is_running = true,
+                ToolCallStatus::Completed | ToolCallStatus::Rejected | ToolCallStatus::Canceled => {
+                }
+            }
+        }
+        summary
+    }
+}
+
+fn is_tool_activity_entry(entry: &AgentThreadEntry) -> bool {
+    match entry {
+        AgentThreadEntry::ToolCall(_) => true,
+        AgentThreadEntry::AssistantMessage(message) => {
+            !message.indented
+                && !message.chunks.is_empty()
+                && message
+                    .chunks
+                    .iter()
+                    .all(|chunk| matches!(chunk, AssistantMessageChunk::Thought { .. }))
+        }
+        AgentThreadEntry::UserMessage(_)
+        | AgentThreadEntry::SessionMessage(_)
+        | AgentThreadEntry::Elicitation(_)
+        | AgentThreadEntry::ContextCompaction(_) => false,
+    }
+}
+
+/// Finds the tool activity group that contains `entry_ix`. A group must have at
+/// least two entries and one tool call, because collapsing a single entry hides
+/// nothing.
+pub(crate) fn tool_activity_group(
+    entries: &[AgentThreadEntry],
+    entry_ix: usize,
+) -> Option<ToolActivityGroup> {
+    if !is_tool_activity_entry(entries.get(entry_ix)?) {
+        return None;
+    }
+    let start = entries[..entry_ix]
+        .iter()
+        .rposition(|entry| !is_tool_activity_entry(entry))
+        .map_or(0, |ix| ix + 1);
+    let end = entries[entry_ix..]
+        .iter()
+        .position(|entry| !is_tool_activity_entry(entry))
+        .map_or(entries.len(), |offset| entry_ix + offset);
+    let range = start..end;
+    if range.len() < 2 {
+        return None;
+    }
+    let id = entries[range.clone()]
+        .iter()
+        .find_map(|entry| match entry {
+            AgentThreadEntry::ToolCall(tool_call) => Some(tool_call.id.clone()),
+            _ => None,
+        })?;
+    Some(ToolActivityGroup { range, id })
+}
 
 pub struct EntryViewEvent {
     pub entry_index: usize,
